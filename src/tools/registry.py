@@ -33,9 +33,9 @@ def get_tool_specs() -> List[Dict[str, Any]]:
         {
             "name": "search_flights",
             "description": (
-                "Tìm vé máy bay (Amadeus TEST API). "
+                "Tìm vé máy bay (Duffel API). "
                 "origin, destination: mã IATA 3 chữ (HAN, DAD, SGN). "
-                "departure_date: YYYY-MM-DD (ngày trong tương lai, theo quy tắc sandbox)."
+                "departure_date: YYYY-MM-DD (ngày khởi hành)."
             ),
             "args": ["origin", "destination", "departure_date"],
         },

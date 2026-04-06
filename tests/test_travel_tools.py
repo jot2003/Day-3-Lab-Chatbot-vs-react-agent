@@ -41,7 +41,7 @@ def test_search_flights_keyword_style():
         "origin=HAN, destination=DAD, departure_date=2026-04-20",
     )
     data = json.loads(raw)
-    assert "error" not in data or "Amadeus" in data.get("error", "")
+    assert "error" not in data or "duffel" in data.get("error", "").lower()
 
 
 def test_unknown_tool():

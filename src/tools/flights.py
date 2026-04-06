@@ -1,117 +1,147 @@
 import json
 import os
-import time
-from typing import Any, Dict, Optional, Tuple
+import re
+from typing import Any, Dict, Optional
 
 import requests
 
 from src.tools.demo_fallback import demo_travel_apis_enabled, mock_flights
 
-AMADEUS_TOKEN_URL = "https://test.api.amadeus.com/v1/security/oauth2/token"
-AMADEUS_OFFERS_URL = "https://test.api.amadeus.com/v2/shopping/flight-offers"
-
-_token: Optional[str] = None
-_token_expires_at: float = 0.0
+DUFFEL_OFFER_REQUESTS_URL = "https://api.duffel.com/air/offer_requests"
+DUFFEL_VERSION = "v2"
 
 
-def _amadeus_credentials() -> Tuple[str, str]:
-    cid = os.getenv("AMADEUS_CLIENT_ID", "").strip()
-    secret = os.getenv("AMADEUS_CLIENT_SECRET", "").strip()
-    return cid, secret
+def _duffel_token() -> str:
+    return os.getenv("DUFFEL_API_TOKEN", "").strip()
 
 
-def _get_amadeus_token() -> str:
-    global _token, _token_expires_at
-    cid, secret = _amadeus_credentials()
-    if not cid or not secret:
-        raise ValueError("AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET missing")
+def _strip_wrapping_quotes(value: str) -> str:
+    s = value.strip()
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        return s[1:-1].strip()
+    return s
 
-    now = time.time()
-    if _token and now < _token_expires_at - 60:
-        return _token
 
-    r = requests.post(
-        AMADEUS_TOKEN_URL,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": cid,
-            "client_secret": secret,
-        },
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
-    _token = data["access_token"]
-    _token_expires_at = now + int(data.get("expires_in", 1700))
-    return _token
+def _normalize_iata(code: str) -> str:
+    return _strip_wrapping_quotes(str(code)).strip().upper()
+
+
+def _normalize_departure_date(value: str) -> str:
+    return _strip_wrapping_quotes(str(value)).strip()
+
+
+def _validate_iata(code: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{3}", code))
+
+
+def _validate_departure_date(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
 
 
 def search_flights(origin: str, destination: str, departure_date: str) -> str:
     """
-    Amadeus Test API: IATA codes (e.g. HAN, DAD, SGN), departure_date YYYY-MM-DD.
-    Sandbox returns sample offers; dates must be in the future per Amadeus rules.
+    Duffel API: IATA codes (e.g. HAN, DAD, SGN), departure_date YYYY-MM-DD.
+    Returns top offers with a simplified shape used by the app UI/agent.
     """
-    if not _amadeus_credentials()[0]:
+    token = _duffel_token()
+    if not token:
         if demo_travel_apis_enabled():
             return mock_flights(origin, destination, departure_date)
         return json.dumps(
             {
-                "error": "Missing AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET",
-                "hint": "https://developers.amadeus.com/ (app Test) — hoặc DEMO_TRAVEL_APIS=1 trong .env để demo không cần Amadeus.",
+                "error": "Missing DUFFEL_API_TOKEN",
+                "hint": "https://duffel.com/air (create API token) — hoặc DEMO_TRAVEL_APIS=1 trong .env để demo không cần Duffel.",
             },
             ensure_ascii=False,
         )
 
-    origin = origin.strip().upper()
-    destination = destination.strip().upper()
-    departure_date = departure_date.strip()
+    origin = _normalize_iata(origin)
+    destination = _normalize_iata(destination)
+    departure_date = _normalize_departure_date(departure_date)
 
-    try:
-        token = _get_amadeus_token()
-    except Exception as e:
-        return json.dumps({"error": "Amadeus auth failed", "detail": str(e)}, ensure_ascii=False)
+    if not _validate_iata(origin) or not _validate_iata(destination) or not _validate_departure_date(departure_date):
+        return json.dumps(
+            {
+                "error": "Invalid flight search inputs",
+                "expected": {
+                    "origin": "IATA code (e.g. HAN)",
+                    "destination": "IATA code (e.g. DAD)",
+                    "departure_date": "YYYY-MM-DD",
+                },
+                "received": {
+                    "origin": origin,
+                    "destination": destination,
+                    "departure_date": departure_date,
+                },
+            },
+            ensure_ascii=False,
+        )
 
-    headers = {"Authorization": f"Bearer {token}"}
-    params: Dict[str, Any] = {
-        "originLocationCode": origin,
-        "destinationLocationCode": destination,
-        "departureDate": departure_date,
-        "adults": 1,
-        "max": 5,
-        "currencyCode": "VND",
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "data": {
+            "slices": [
+                {
+                    "origin": origin,
+                    "destination": destination,
+                    "departure_date": departure_date,
+                }
+            ],
+            "passengers": [{"type": "adult"}],
+            "cabin_class": "economy",
+            "max_connections": 2,
+        }
     }
 
     try:
-        r = requests.get(AMADEUS_OFFERS_URL, headers=headers, params=params, timeout=25)
+        r = requests.post(DUFFEL_OFFER_REQUESTS_URL, headers=headers, json=payload, timeout=30)
         if r.status_code >= 400:
+            details = None
+            try:
+                err_json = r.json()
+                if isinstance(err_json, dict):
+                    details = [
+                        {
+                            "field": ((e.get("source") or {}).get("field") or ""),
+                            "message": e.get("message") or e.get("title") or "",
+                            "code": e.get("code") or "",
+                        }
+                        for e in (err_json.get("errors") or [])
+                    ]
+            except ValueError:
+                details = None
             return json.dumps(
                 {
-                    "error": "Amadeus flight search failed",
+                    "error": "Duffel flight search failed",
                     "status": r.status_code,
                     "body": r.text[:2000],
+                    "validation_errors": details,
                 },
                 ensure_ascii=False,
             )
         data = r.json()
     except requests.RequestException as e:
-        return json.dumps({"error": "Amadeus request failed", "detail": str(e)}, ensure_ascii=False)
+        return json.dumps({"error": "Duffel request failed", "detail": str(e)}, ensure_ascii=False)
 
     offers = []
-    for item in data.get("data", [])[:5]:
-        price = (item.get("price") or {}).get("grandTotal") or (item.get("price") or {}).get("total")
-        currency = (item.get("price") or {}).get("currency", "VND")
-        itineraries = item.get("itineraries") or []
-        first = itineraries[0] if itineraries else {}
-        segs = first.get("segments") or []
+    raw_offers = (data.get("data") or {}).get("offers") or []
+    for item in raw_offers[:5]:
+        slices = item.get("slices") or []
+        first_slice = slices[0] if slices else {}
+        segs = first_slice.get("segments") or []
         first_seg = segs[0] if segs else {}
         last_seg = segs[-1] if segs else {}
         offers.append(
             {
-                "price": price,
-                "currency": currency,
-                "departure_at": first_seg.get("departure", {}).get("at"),
-                "arrival_at": last_seg.get("arrival", {}).get("at"),
-                "carrier_code": (first_seg.get("carrierCode") or ""),
+                "price": item.get("total_amount"),
+                "currency": item.get("total_currency", "USD"),
+                "departure_at": (first_seg.get("departing_at") or first_slice.get("departing_at")),
+                "arrival_at": (last_seg.get("arriving_at") or first_slice.get("arriving_at")),
+                "carrier_code": ((first_seg.get("marketing_carrier") or {}).get("iata_code") or ""),
                 "number_of_stops": max(0, len(segs) - 1),
             }
         )
@@ -119,10 +149,10 @@ def search_flights(origin: str, destination: str, departure_date: str) -> str:
     if not offers:
         return json.dumps(
             {
-                "message": "No offers returned (common in sandbox for some routes/dates).",
-                "raw_dictionaries": bool(data.get("dictionaries")),
+                "message": "No offers returned for the selected route/date.",
+                "raw_meta": bool((data.get("meta") or {})),
             },
             ensure_ascii=False,
         )
 
-    return json.dumps({"offers": offers, "source": "amadeus_test"}, ensure_ascii=False)
+    return json.dumps({"offers": offers, "source": "duffel"}, ensure_ascii=False)
